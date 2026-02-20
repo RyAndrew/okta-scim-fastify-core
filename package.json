@@ -1,0 +1,20 @@
+{
+  "name": "scim-fastify-core",
+  "version": "1.0.0",
+  "description": "Shared SCIM 2.0 protocol layer for Fastify-based SCIM bridges",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "fastify": "^5.7.4",
+    "fastify-plugin": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.3"
+  }
+}
