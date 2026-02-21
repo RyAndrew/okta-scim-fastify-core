@@ -69,10 +69,13 @@ function applyPath(
   verb: 'add' | 'remove' | 'replace',
   value: unknown,
 ): PathResult {
-  // Simple attribute: "active", "displayName", "userName"
+  // Simple attribute: "active", "displayName", "userName", "members"
   if (!path.includes('.') && !path.includes('[')) {
     if (verb === 'remove') {
       delete resource[path];
+    } else if (verb === 'add' && Array.isArray(value) && Array.isArray(resource[path])) {
+      // RFC 7644 §3.5.2.1: adding to an existing multi-valued attribute appends
+      resource[path] = [...(resource[path] as unknown[]), ...(value as unknown[])];
     } else {
       resource[path] = value;
     }

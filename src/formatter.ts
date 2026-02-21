@@ -1,5 +1,6 @@
 import {
   ScimUser,
+  ScimGroup,
   ScimListResponse,
   ScimErrorBody,
   SCIM_SCHEMA_LIST,
@@ -8,11 +9,7 @@ import {
 
 /**
  * Adds or updates `meta.location` on a SCIM User resource.
- * Call this in route handlers after receiving a user from the backend.
- *
- * @param user       The ScimUser returned by the backend.
- * @param usersBaseUrl  The fully-qualified base URL of the /Users collection,
- *                      e.g. `https://example.com/scim/v2/Users`.
+ * @param usersBaseUrl  e.g. `https://example.com/scim/v2/Users`
  */
 export function withScimMeta(user: ScimUser, usersBaseUrl: string): ScimUser {
   return {
@@ -25,17 +22,32 @@ export function withScimMeta(user: ScimUser, usersBaseUrl: string): ScimUser {
   };
 }
 
-export function formatListResponse(
-  users: ScimUser[],
+/**
+ * Adds or updates `meta.location` on a SCIM Group resource.
+ * @param groupsBaseUrl  e.g. `https://example.com/scim/v2/Groups`
+ */
+export function withGroupMeta(group: ScimGroup, groupsBaseUrl: string): ScimGroup {
+  return {
+    ...group,
+    meta: {
+      resourceType: 'Group',
+      ...group.meta,
+      location: `${groupsBaseUrl}/${group.id}`,
+    },
+  };
+}
+
+export function formatListResponse<T>(
+  resources: T[],
   totalResults: number,
   startIndex: number,
-): ScimListResponse<ScimUser> {
+): ScimListResponse<T> {
   return {
     schemas: [SCIM_SCHEMA_LIST],
     totalResults,
     startIndex,
-    itemsPerPage: users.length,
-    Resources: users,
+    itemsPerPage: resources.length,
+    Resources: resources,
   };
 }
 

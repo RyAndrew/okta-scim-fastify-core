@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 export const SCIM_SCHEMA_USER = 'urn:ietf:params:scim:schemas:core:2.0:User';
+export const SCIM_SCHEMA_GROUP = 'urn:ietf:params:scim:schemas:core:2.0:Group';
 export const SCIM_SCHEMA_LIST = 'urn:ietf:params:scim:api:messages:2.0:ListResponse';
 export const SCIM_SCHEMA_ERROR = 'urn:ietf:params:scim:api:messages:2.0:Error';
 export const SCIM_SCHEMA_PATCH_OP = 'urn:ietf:params:scim:api:messages:2.0:PatchOp';
@@ -56,6 +57,29 @@ export interface ScimUser {
 }
 
 // ---------------------------------------------------------------------------
+// SCIM Group resource (RFC 7643 §4.2)
+// ---------------------------------------------------------------------------
+
+export interface ScimGroupMember {
+  /** User id */
+  value: string;
+  /** URL reference to the User resource */
+  $ref?: string;
+  /** Display name of the member */
+  display?: string;
+  type?: 'User' | 'Group';
+}
+
+export interface ScimGroup {
+  schemas: string[];
+  id: string;
+  externalId?: string;
+  displayName: string;
+  members?: ScimGroupMember[];
+  meta?: ScimMeta;
+}
+
+// ---------------------------------------------------------------------------
 // SCIM List response
 // ---------------------------------------------------------------------------
 
@@ -96,11 +120,13 @@ export interface ScimPatchOp {
 }
 
 // ---------------------------------------------------------------------------
-// Backend contract
+// Backend contracts
 // ---------------------------------------------------------------------------
 
+type ParsedFilter = import('./filter-parser').ParsedFilter;
+
 export interface ListUsersOptions {
-  filter?: import('./filter-parser').ParsedFilter;
+  filter?: ParsedFilter;
   startIndex: number;
   count: number;
 }
@@ -110,8 +136,19 @@ export interface ListUsersResult {
   totalResults: number;
 }
 
+export interface ListGroupsOptions {
+  filter?: ParsedFilter;
+  startIndex: number;
+  count: number;
+}
+
+export interface ListGroupsResult {
+  groups: ScimGroup[];
+  totalResults: number;
+}
+
 /**
- * Every downstream backend must implement this interface.
+ * Every downstream user backend must implement this interface.
  * Methods throw {@link ScimBackendError} to signal protocol-level errors.
  */
 export interface ScimBackend {
@@ -121,4 +158,17 @@ export interface ScimBackend {
   replaceUser(id: string, user: ScimUser): Promise<ScimUser>;
   patchUser(id: string, patch: ScimPatchOp): Promise<ScimUser>;
   deleteUser(id: string): Promise<void>;
+}
+
+/**
+ * Every downstream group backend must implement this interface.
+ * Methods throw {@link ScimBackendError} to signal protocol-level errors.
+ */
+export interface ScimGroupBackend {
+  listGroups(opts: ListGroupsOptions): Promise<ListGroupsResult>;
+  getGroup(id: string): Promise<ScimGroup>;
+  createGroup(group: ScimGroup): Promise<ScimGroup>;
+  replaceGroup(id: string, group: ScimGroup): Promise<ScimGroup>;
+  patchGroup(id: string, patch: ScimPatchOp): Promise<ScimGroup>;
+  deleteGroup(id: string): Promise<void>;
 }
