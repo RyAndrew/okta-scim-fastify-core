@@ -12,6 +12,7 @@ import fp from 'fastify-plugin';
 import { ScimBackendError } from '../errors';
 import { parseScimFilter } from '../filter-parser';
 import { withGroupMeta, formatListResponse, formatError } from '../formatter';
+import { registerScimJsonParser, scimBodyRouteOptions } from '../request-body';
 import { ScimGroup, ScimPatchOp, ScimGroupBackend } from '../types';
 
 // Import for FastifyInstance.authenticate type augmentation
@@ -42,6 +43,7 @@ export function createScimGroupsPlugin(
   return fp(
     async function scimGroupsPlugin(server: FastifyInstance): Promise<void> {
       server.addHook('onRequest', server.authenticate);
+      registerScimJsonParser(server);
 
       function groupsBaseUrl(request: FastifyRequest): string {
         return `${request.protocol}://${request.hostname}${groupsPath}`;
@@ -108,7 +110,7 @@ export function createScimGroupsPlugin(
       // POST /Groups  — create
       // ────────────────────────────────────────────────────────────────────
 
-      server.post<{ Body: ScimGroup }>('/', async (request, reply) => {
+      server.post<{ Body: ScimGroup }>('/', scimBodyRouteOptions, async (request, reply) => {
         const group = request.body;
 
         if (!group.displayName) {
@@ -137,6 +139,7 @@ export function createScimGroupsPlugin(
 
       server.put<{ Params: { id: string }; Body: ScimGroup }>(
         '/:id',
+        scimBodyRouteOptions,
         async (request, reply) => {
           const { id } = request.params;
 
@@ -158,6 +161,7 @@ export function createScimGroupsPlugin(
 
       server.patch<{ Params: { id: string }; Body: ScimPatchOp }>(
         '/:id',
+        scimBodyRouteOptions,
         async (request, reply) => {
           const { id } = request.params;
           const patch = request.body;

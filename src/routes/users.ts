@@ -12,6 +12,7 @@ import fp from 'fastify-plugin';
 import { ScimBackendError } from '../errors';
 import { parseScimFilter } from '../filter-parser';
 import { withScimMeta, formatListResponse, formatError } from '../formatter';
+import { registerScimJsonParser, scimBodyRouteOptions } from '../request-body';
 import { ScimUser, ScimPatchOp, ScimBackend } from '../types';
 
 // Import for FastifyInstance.authenticate type augmentation
@@ -42,6 +43,7 @@ export function createScimUsersPlugin(
   return fp(
     async function scimUsersPlugin(server: FastifyInstance): Promise<void> {
       server.addHook('onRequest', server.authenticate);
+      registerScimJsonParser(server);
 
       function usersBaseUrl(request: FastifyRequest): string {
         return `${request.protocol}://${request.hostname}${usersPath}`;
@@ -108,7 +110,7 @@ export function createScimUsersPlugin(
       // POST /Users  — provision
       // ────────────────────────────────────────────────────────────────────
 
-      server.post<{ Body: ScimUser }>('/', async (request, reply) => {
+      server.post<{ Body: ScimUser }>('/', scimBodyRouteOptions, async (request, reply) => {
         const scimUser = request.body;
 
         if (!scimUser.userName) {
@@ -137,6 +139,7 @@ export function createScimUsersPlugin(
 
       server.put<{ Params: { id: string }; Body: ScimUser }>(
         '/:id',
+        scimBodyRouteOptions,
         async (request, reply) => {
           const { id } = request.params;
 
@@ -158,6 +161,7 @@ export function createScimUsersPlugin(
 
       server.patch<{ Params: { id: string }; Body: ScimPatchOp }>(
         '/:id',
+        scimBodyRouteOptions,
         async (request, reply) => {
           const { id } = request.params;
           const patch = request.body;
