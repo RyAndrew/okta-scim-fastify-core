@@ -11,8 +11,53 @@ import type { ScimUserBackend } from '../backend';
 import type { CoreConfig } from '../config';
 import { ScimBackendError } from '../errors';
 import { SCIM_CONTENT_TYPE, formatListResponse } from '../responses';
-import { SCIM_SCHEMA_ENTERPRISE_USER, SCIM_SCHEMA_USER } from '../types';
+import { SCIM_SCHEMA_ENTERPRISE_USER, SCIM_SCHEMA_GROUP, SCIM_SCHEMA_USER } from '../types';
 import { schemaAttributesFor } from '../user-attributes';
+
+function attribute(name: string, type: string, description: string, extra: object = {}) {
+  return {
+    name,
+    type,
+    multiValued: false,
+    description,
+    required: false,
+    caseExact: false,
+    mutability: 'readWrite',
+    returned: 'default',
+    uniqueness: 'none',
+    ...extra,
+  };
+}
+
+/** SCIM schema attributes of the Group resource, for the declared paths. */
+function groupSchemaAttributes(declared: ReadonlySet<string>): object[] {
+  const out: object[] = [
+    attribute('displayName', 'string', 'A human-readable name for the group.', { required: true }),
+  ];
+  if (declared.has('externalId')) {
+    out.push(attribute('externalId', 'string', 'Identifier issued by the provisioning client.', { caseExact: true }));
+  }
+  if (declared.has('members')) {
+    out.push(
+      attribute('members', 'complex', 'The users that belong to the group.', {
+        multiValued: true,
+        subAttributes: [
+          attribute('value', 'string', 'The id of the member user.', { mutability: 'immutable' }),
+          attribute('$ref', 'reference', 'The URI of the member user.', {
+            mutability: 'immutable',
+            referenceTypes: ['User'],
+          }),
+          attribute('display', 'string', 'A human-readable name for the member.', { mutability: 'readOnly' }),
+          attribute('type', 'string', "The member's type. Only 'User' is supported.", {
+            mutability: 'immutable',
+            canonicalValues: ['User'],
+          }),
+        ],
+      }),
+    );
+  }
+  return out;
+}
 
 const SCHEMA_SPC = 'urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig';
 const SCHEMA_RESOURCE_TYPE = 'urn:ietf:params:scim:schemas:core:2.0:ResourceType';
@@ -25,6 +70,7 @@ export interface DiscoveryRoutesOptions {
 
 export function scimDiscoveryRoutes(options: DiscoveryRoutesOptions): FastifyPluginAsync {
   const { backend, config } = options;
+  const { groups } = backend;
   const declared: ReadonlySet<string> = new Set(backend.attributes);
   const enterpriseAttributes = schemaAttributesFor(declared, SCIM_SCHEMA_ENTERPRISE_USER);
   const hasEnterprise = enterpriseAttributes.length > 0;
@@ -82,18 +128,37 @@ export function scimDiscoveryRoutes(options: DiscoveryRoutesOptions): FastifyPlu
       },
     });
 
-    server.get('/ResourceTypes', async (request, reply) =>
-      reply
+    const groupResourceType = (request: FastifyRequest) => ({
+      schemas: [SCHEMA_RESOURCE_TYPE],
+      id: 'Group',
+      name: 'Group',
+      endpoint: '/Groups',
+      description: 'Group',
+      schema: SCIM_SCHEMA_GROUP,
+      schemaExtensions: [],
+      meta: {
+        resourceType: 'ResourceType',
+        location: `${baseUrl(request)}/ResourceTypes/Group`,
+      },
+    });
+
+    const resourceTypes = (request: FastifyRequest) =>
+      groups ? [userResourceType(request), groupResourceType(request)] : [userResourceType(request)];
+
+    server.get('/ResourceTypes', async (request, reply) => {
+      const list = resourceTypes(request);
+      return reply
         .status(200)
         .type(SCIM_CONTENT_TYPE)
-        .send(formatListResponse([userResourceType(request)], 1, 1)),
-    );
+        .send(formatListResponse(list, list.length, 1));
+    });
 
     server.get<{ Params: { id: string } }>('/ResourceTypes/:id', async (request, reply) => {
-      if (request.params.id !== 'User') {
+      const type = resourceTypes(request).find((t) => t.id === request.params.id);
+      if (!type) {
         throw new ScimBackendError(404, `ResourceType ${request.params.id} not found.`);
       }
-      return reply.status(200).type(SCIM_CONTENT_TYPE).send(userResourceType(request));
+      return reply.status(200).type(SCIM_CONTENT_TYPE).send(type);
     });
 
     // ── Schemas ────────────────────────────────────────────────────────────
@@ -129,6 +194,19 @@ export function scimDiscoveryRoutes(options: DiscoveryRoutesOptions): FastifyPlu
           },
         },
       ];
+      if (groups) {
+        list.push({
+          schemas: [SCHEMA_SCHEMA],
+          id: SCIM_SCHEMA_GROUP,
+          name: 'Group',
+          description: 'Group',
+          attributes: groupSchemaAttributes(new Set(groups.attributes)),
+          meta: {
+            resourceType: 'Schema',
+            location: `${baseUrl(request)}/Schemas/${SCIM_SCHEMA_GROUP}`,
+          },
+        });
+      }
       if (hasEnterprise) {
         list.push({
           schemas: [SCHEMA_SCHEMA],

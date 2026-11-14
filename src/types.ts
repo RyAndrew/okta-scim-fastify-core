@@ -81,7 +81,7 @@ export interface ScimUser {
 }
 
 // ---------------------------------------------------------------------------
-// Groups (RFC 7643 §4.2) — types only; Groups are not wired into the server yet
+// Groups (RFC 7643 §4.2) — served when the backend provides `groups`
 // ---------------------------------------------------------------------------
 
 export interface ScimGroupMember {

@@ -4,7 +4,13 @@
 // Every setting is required: there are no defaults. The reader collects every
 // missing or invalid variable from core and from the backend module, so that
 // startup fails once with the complete list.
+//
+// Any variable NAME can instead be given as NAME_FILE, the path of a file that
+// holds the value (Docker / Kubernetes secrets). One trailing newline is
+// stripped. Setting both NAME and NAME_FILE is an error.
 // ---------------------------------------------------------------------------
+
+import fs from 'fs';
 
 export class EnvError extends Error {
   constructor(public readonly problems: readonly string[]) {
@@ -19,13 +25,40 @@ export class EnvError extends Error {
 export class Env {
   private readonly problems: string[] = [];
 
-  constructor(private readonly source: Record<string, string | undefined>) {}
+  constructor(
+    private readonly source: Record<string, string | undefined>,
+    private readonly readFile: (path: string) => string = (path) => fs.readFileSync(path, 'utf8'),
+  ) {}
 
-  /** A non-empty string. */
+  /** A non-empty string, from NAME or from the file named by NAME_FILE. */
   require(name: string, description: string): string {
-    const value = this.source[name];
-    if (value === undefined || value.trim() === '') {
-      this.problems.push(`${name} is not set. ${description}`);
+    const direct = this.source[name];
+    const hasDirect = direct !== undefined && direct.trim() !== '';
+    const filePath = this.source[`${name}_FILE`];
+
+    if (filePath === undefined || filePath.trim() === '') {
+      if (!hasDirect) {
+        this.problems.push(`${name} is not set. ${description}`);
+        return '';
+      }
+      return direct as string;
+    }
+
+    if (hasDirect) {
+      this.problems.push(`${name} and ${name}_FILE are both set; set only one. ${description}`);
+      return '';
+    }
+
+    let value: string;
+    try {
+      value = this.readFile(filePath).replace(/\r?\n$/, '');
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.problems.push(`${name}_FILE='${filePath}' could not be read: ${reason}. ${description}`);
+      return '';
+    }
+    if (value.trim() === '') {
+      this.problems.push(`${name}_FILE='${filePath}' is empty. ${description}`);
       return '';
     }
     return value;

@@ -15,7 +15,24 @@ export type {
   UserSort,
   UserPage,
   UserUpdate,
+  ScimGroupBackend,
+  GroupLookup,
+  GroupLookupKey,
+  GroupQuery,
+  GroupPage,
+  GroupUpdate,
+  MemberChange,
 } from './backend';
+
+// Group profile
+export { groupAttributesOf, parseGroupAttributes, KNOWN_GROUP_ATTRIBUTE_PATHS } from './group-attributes';
+export type {
+  GroupAttributes,
+  GroupAttributePath,
+  GroupMember,
+  StoredGroup,
+} from './group-attributes';
+export { applyGroupPatch } from './group-patch';
 
 // User profile
 export {
@@ -51,9 +68,15 @@ export { SqliteAuditSink } from './audit/sqlite-sink';
 
 // Protocol pieces (exported for tests and for backends that need them)
 export { applyPatchOps } from './patch-applier';
-export { parseScimFilter, resolveUserLookup } from './filter-parser';
+export { parseScimFilter, resolveUserLookup, resolveGroupLookup } from './filter-parser';
 export type { ParsedFilter } from './filter-parser';
-export { formatError, formatListResponse, toUserResource, SCIM_CONTENT_TYPE } from './responses';
+export {
+  formatError,
+  formatListResponse,
+  toUserResource,
+  toGroupResource,
+  SCIM_CONTENT_TYPE,
+} from './responses';
 
 // SCIM wire types and constants
 export {

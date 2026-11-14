@@ -5,12 +5,15 @@
 import {
   SCIM_SCHEMA_ENTERPRISE_USER,
   SCIM_SCHEMA_ERROR,
+  SCIM_SCHEMA_GROUP,
   SCIM_SCHEMA_LIST,
   SCIM_SCHEMA_USER,
   ScimErrorBody,
+  ScimGroup,
   ScimListResponse,
   ScimUser,
 } from './types';
+import type { StoredGroup } from './group-attributes';
 import { StoredUser } from './user-attributes';
 
 export const SCIM_CONTENT_TYPE = 'application/scim+json';
@@ -31,6 +34,35 @@ export function toUserResource(user: StoredUser, usersUrl: string): ScimUser {
       created,
       lastModified,
       location: `${usersUrl}/${encodeURIComponent(id)}`,
+    },
+  };
+}
+
+/**
+ * Build the Group resource returned to the client. Members are always users;
+ * `$ref` points at the member's /Users resource.
+ */
+export function toGroupResource(group: StoredGroup, groupsUrl: string, usersUrl: string): ScimGroup {
+  const { id, created, lastModified, members, ...attributes } = group;
+  return {
+    schemas: [SCIM_SCHEMA_GROUP],
+    id,
+    ...attributes,
+    ...(members !== undefined
+      ? {
+          members: members.map((m) => ({
+            value: m.value,
+            $ref: `${usersUrl}/${encodeURIComponent(m.value)}`,
+            ...(m.display !== undefined ? { display: m.display } : {}),
+            type: 'User' as const,
+          })),
+        }
+      : {}),
+    meta: {
+      resourceType: 'Group',
+      created,
+      lastModified,
+      location: `${groupsUrl}/${encodeURIComponent(id)}`,
     },
   };
 }

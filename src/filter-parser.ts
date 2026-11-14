@@ -6,7 +6,7 @@
 // `invalidFilter` — a filter is never silently dropped.
 // ---------------------------------------------------------------------------
 
-import type { UserLookup, UserLookupKey } from './backend';
+import type { GroupLookup, GroupLookupKey, UserLookup, UserLookupKey } from './backend';
 import { ScimErrors } from './errors';
 
 export interface ParsedFilter {
@@ -51,6 +51,29 @@ export function resolveUserLookup(
     throw ScimErrors.invalidFilter(
       `Unsupported filter '${parsed.attribute} ${parsed.operator}'. ` +
         `Only 'eq' on these attributes is supported: ${filterableAttributes(supported).join(', ')}.`,
+    );
+  }
+  return { by, value: parsed.value };
+}
+
+const FILTER_ATTRIBUTE_TO_GROUP_LOOKUP: Record<string, GroupLookupKey> = {
+  id: 'id',
+  displayname: 'displayName',
+  externalid: 'externalId',
+};
+
+/** Map a /Groups filter string to one of the group backend's declared lookups, or throw 400. */
+export function resolveGroupLookup(
+  filter: string,
+  supported: readonly GroupLookupKey[],
+): GroupLookup {
+  const parsed = parseScimFilter(filter);
+  const by = FILTER_ATTRIBUTE_TO_GROUP_LOOKUP[parsed.attribute.toLowerCase()];
+
+  if (parsed.operator !== 'eq' || !by || !supported.includes(by)) {
+    throw ScimErrors.invalidFilter(
+      `Unsupported filter '${parsed.attribute} ${parsed.operator}'. ` +
+        `Only 'eq' on these attributes is supported: ${supported.join(', ')}.`,
     );
   }
   return { by, value: parsed.value };

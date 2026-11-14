@@ -19,7 +19,9 @@ import { Env, EnvError } from './env';
 import { ScimBackendError } from './errors';
 import { createAuthHook } from './plugins/auth';
 import { SCIM_CONTENT_TYPE, formatError } from './responses';
+import { KNOWN_GROUP_ATTRIBUTE_PATHS } from './group-attributes';
 import { scimDiscoveryRoutes } from './routes/discovery';
+import { scimGroupsRoutes } from './routes/groups';
 import { scimUsersRoutes } from './routes/users';
 import { KNOWN_USER_ATTRIBUTE_PATHS } from './user-attributes';
 
@@ -30,7 +32,10 @@ export interface CreateScimServerOptions<TConfig> {
   config: CoreConfig;
   backendConfig: TConfig;
   sink: AuditSink;
-  /** PEM key and certificate. Omit only when the server is driven in-process (tests). */
+  /**
+   * PEM key and certificate. Omit to serve plain HTTP: in-process tests, or
+   * behind a TLS-terminating proxy (`SSL_ENABLED=false`).
+   */
   tls?: { key: Buffer; cert: Buffer };
 }
 
@@ -45,6 +50,7 @@ export async function createScimServer<TConfig>(
 
   const server = Fastify({
     ...(options.tls ? { https: options.tls } : {}),
+    trustProxy: config.trustProxy,
     logger: { level: config.logLevel },
     genReqId: () => randomUUID(),
   }) as unknown as FastifyInstance;
@@ -104,11 +110,22 @@ export async function createScimServer<TConfig>(
       .send(formatError(404, `No route for ${request.method} ${request.url.split('?')[0]}.`)),
   );
 
+  const authenticate = createAuthHook(config.apiKey);
   await server.register(scimDiscoveryRoutes({ backend, config }), { prefix: SCIM_BASE_PATH });
-  await server.register(
-    scimUsersRoutes({ backend, config, authenticate: createAuthHook(config.apiKey) }),
-    { prefix: `${SCIM_BASE_PATH}/Users` },
-  );
+  await server.register(scimUsersRoutes({ backend, config, authenticate }), {
+    prefix: `${SCIM_BASE_PATH}/Users`,
+  });
+  if (backend.groups) {
+    await server.register(
+      scimGroupsRoutes({
+        groups: backend.groups,
+        config,
+        authenticate,
+        usersPath: `${SCIM_BASE_PATH}/Users`,
+      }),
+      { prefix: `${SCIM_BASE_PATH}/Groups` },
+    );
+  }
 
   server.get('/health', async (_request, reply) =>
     reply.status(200).send({ status: 'ok', backend: module.name }),
@@ -129,11 +146,26 @@ function assertBackendDeclaration(name: string, backend: ScimUserBackend): void 
   if (!backend.lookups.includes('id')) {
     throw new Error(`Backend '${name}' must declare the 'id' lookup.`);
   }
+
+  const { groups } = backend;
+  if (groups) {
+    const unknownGroup = groups.attributes.filter((p) => !KNOWN_GROUP_ATTRIBUTE_PATHS.has(p));
+    if (unknownGroup.length > 0) {
+      throw new Error(`Backend '${name}' declares unknown group attributes: ${unknownGroup.join(', ')}`);
+    }
+    if (!groups.attributes.includes('displayName')) {
+      throw new Error(`Backend '${name}' must declare the group 'displayName' attribute.`);
+    }
+    if (!groups.lookups.includes('id')) {
+      throw new Error(`Backend '${name}' must declare the group 'id' lookup.`);
+    }
+  }
 }
 
 /**
  * Load configuration from the environment (and a `.env` file in the working
- * directory, if there is one), start the HTTPS server and exit on failure.
+ * directory, if there is one), start the server (HTTPS unless SSL_ENABLED=false)
+ * and exit on failure.
  */
 export async function startScimServer<TConfig>(module: BackendModule<TConfig>): Promise<void> {
   dotenv.config({ quiet: true });
@@ -151,11 +183,16 @@ export async function startScimServer<TConfig>(module: BackendModule<TConfig>): 
       config,
       backendConfig,
       sink: new SqliteAuditSink(config.auditDbPath),
-      tls: {
-        key: fs.readFileSync(config.ssl.keyPath),
-        cert: fs.readFileSync(config.ssl.certPath),
-      },
+      tls: config.ssl.enabled
+        ? { key: fs.readFileSync(config.ssl.keyPath), cert: fs.readFileSync(config.ssl.certPath) }
+        : undefined,
     });
+    if (!config.ssl.enabled) {
+      server.log.warn(
+        'SSL_ENABLED=false: serving plain HTTP. Terminate TLS in front of this server; ' +
+          'Okta requires HTTPS and the API key travels in every request.',
+      );
+    }
   } catch (err) {
     // Startup failures are printed plainly: the logger may not exist yet
     console.error(err instanceof EnvError ? err.message : err);

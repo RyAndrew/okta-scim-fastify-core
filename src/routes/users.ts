@@ -229,7 +229,7 @@ export function scimUsersRoutes(options: UsersRoutesOptions): FastifyPluginAsync
 // ---------------------------------------------------------------------------
 
 /** The request body as a JSON object carrying the expected schema URN. */
-function requireBody(request: FastifyRequest, schema: string): Body {
+export function requireBody(request: FastifyRequest, schema: string): Body {
   const contentType = request.headers['content-type'] ?? '';
   if (!JSON_CONTENT_TYPE.test(contentType)) {
     throw new ScimBackendError(
@@ -259,7 +259,7 @@ function withoutProtocolMembers(body: Body): Body {
   return profile;
 }
 
-function readInteger(raw: string | undefined, name: string): number | undefined {
+export function readInteger(raw: string | undefined, name: string): number | undefined {
   if (raw === undefined) return undefined;
   if (!/^-?\d+$/.test(raw)) {
     throw ScimErrors.invalidValue(`Query parameter '${name}' must be an integer.`);

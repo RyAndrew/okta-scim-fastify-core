@@ -14,7 +14,11 @@ import {
   SCIM_SCHEMA_PATCH_OP,
   SCIM_SCHEMA_USER,
   ScimErrors,
+  SCIM_SCHEMA_GROUP,
+  GroupUpdate,
+  ScimGroupBackend,
   ScimUserBackend,
+  StoredGroup,
   StoredUser,
   UserAttributes,
   UserUpdate,
@@ -39,10 +43,17 @@ class MemorySink implements AuditSink {
   }
 }
 
+interface MemoryGroup {
+  group: StoredGroup;
+  members: Set<string>;
+}
+
 interface MemoryState {
   users: Map<string, StoredUser>;
   passwords: Map<string, string>;
   updates: UserUpdate[];
+  groups: Map<string, MemoryGroup>;
+  groupUpdates: GroupUpdate[];
   nextId: number;
   clock: number;
 }
@@ -51,21 +62,91 @@ const state: MemoryState = {
   users: new Map(),
   passwords: new Map(),
   updates: [],
+  groups: new Map(),
+  groupUpdates: [],
   nextId: 1,
   clock: 0,
 };
+
+function requireUsers(ids: readonly string[]): void {
+  const unknown = ids.filter((id) => !state.users.has(id));
+  if (unknown.length > 0) throw ScimErrors.invalidValue(`Not users: ${unknown.join(', ')}.`);
+}
+
+function memoryGroups(): ScimGroupBackend {
+  const read = (g: MemoryGroup, includeMembers: boolean): StoredGroup => ({
+    ...structuredClone(g.group),
+    ...(includeMembers
+      ? {
+          members: [...g.members].map((id) => ({ value: id, display: state.users.get(id)?.userName })),
+        }
+      : {}),
+  });
+  return {
+    attributes: ['displayName', 'externalId', 'members'],
+    lookups: ['id', 'displayName', 'externalId'],
+    async getGroup(id, { includeMembers }) {
+      const g = state.groups.get(id);
+      return g ? read(g, includeMembers) : null;
+    },
+    async listGroups(query) {
+      let all = [...state.groups.values()];
+      const { lookup } = query;
+      if (lookup) all = all.filter((g) => (g.group as unknown as Record<string, unknown>)[lookup.by] === lookup.value);
+      const ordered = all.sort((a, b) => (a.group.created < b.group.created ? 1 : -1));
+      const offset = query.startIndex - 1;
+      return {
+        groups: ordered.slice(offset, offset + query.count).map((g) => read(g, query.includeMembers)),
+        totalResults: ordered.length,
+      };
+    },
+    async createGroup(group, memberIds) {
+      requireUsers(memberIds);
+      if ([...state.groups.values()].some((g) => g.group.displayName === group.displayName)) {
+        throw ScimErrors.uniqueness(`displayName '${group.displayName}' already exists.`);
+      }
+      const id = `g${state.nextId++}`;
+      const now = tick();
+      state.groups.set(id, {
+        group: { ...structuredClone(group), id, created: now, lastModified: now },
+        members: new Set(memberIds),
+      });
+      return id;
+    },
+    async updateGroup(id, update) {
+      state.groupUpdates.push(structuredClone(update));
+      const g = state.groups.get(id)!;
+      const { members } = update;
+      if (members) {
+        if ('replace' in members) {
+          requireUsers(members.replace);
+          g.members = new Set(members.replace);
+        } else {
+          requireUsers(members.add);
+          members.add.forEach((m) => g.members.add(m));
+          members.remove.forEach((m) => g.members.delete(m));
+        }
+      }
+      g.group = { ...structuredClone(update.group), id, created: g.group.created, lastModified: tick() };
+    },
+    async deleteGroup(id) {
+      state.groups.delete(id);
+    },
+  };
+}
 
 function tick(): string {
   state.clock += 1;
   return new Date(Date.UTC(2026, 0, 1, 0, 0, state.clock)).toISOString();
 }
 
-function memoryModule(withPassword: boolean): BackendModule<null> {
+function memoryModule(withPassword: boolean, withGroups = false): BackendModule<null> {
   return {
     name: 'memory',
     loadConfig: () => null,
     create: (_config, context): ScimUserBackend => {
       const backend: ScimUserBackend = {
+        ...(withGroups ? { groups: memoryGroups() } : {}),
         attributes: [
           'userName',
           'name.givenName',
@@ -153,7 +234,8 @@ function config(overrides: Partial<CoreConfig> = {}): CoreConfig {
     port: 0,
     logLevel: 'fatal',
     apiKey: API_KEY,
-    ssl: { certPath: '', keyPath: '' },
+    ssl: { enabled: false },
+    trustProxy: false,
     auditDbPath: '',
     unsupportedAttributes: 'reject',
     defaultCount: 100,
@@ -166,6 +248,8 @@ function resetState(): void {
   state.users.clear();
   state.passwords.clear();
   state.updates = [];
+  state.groups.clear();
+  state.groupUpdates = [];
   state.nextId = 1;
   state.clock = 0;
 }
@@ -589,6 +673,246 @@ describe('SCIM server options', () => {
     assert.equal(res.statusCode, 400);
     const spc = (await server.inject({ url: '/scim/v2/ServiceProviderConfig' })).json();
     assert.equal(spc.changePassword.supported, false);
+    await server.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('SCIM groups', () => {
+  let server: FastifyInstance;
+  let sink: MemorySink;
+
+  before(async () => {
+    sink = new MemorySink();
+    server = await createScimServer({
+      module: memoryModule(true, true),
+      config: config(),
+      backendConfig: null,
+      sink,
+    });
+  });
+  after(() => server.close());
+  beforeEach(() => {
+    resetState();
+    sink.requests = [];
+    sink.operations = [];
+  });
+
+  const newGroup = (displayName: string, members: string[] = [], extra: object = {}) => ({
+    schemas: [SCIM_SCHEMA_GROUP],
+    displayName,
+    members: members.map((value) => ({ value, display: 'ignored' })),
+    ...extra,
+  });
+  const postGroup = (payload: object) =>
+    server.inject({ method: 'POST', url: '/scim/v2/Groups', headers: SCIM_JSON, payload });
+  const patchGroup = (id: string, operations: object[]) =>
+    server.inject({
+      method: 'PATCH',
+      url: `/scim/v2/Groups/${id}`,
+      headers: SCIM_JSON,
+      payload: patch(operations),
+    });
+  const memberIds = (id: string) => [...state.groups.get(id)!.members].sort();
+
+  it('lists Group in discovery', async () => {
+    const types = (await server.inject({ url: '/scim/v2/ResourceTypes' })).json();
+    assert.deepEqual(types.Resources.map((t: { id: string }) => t.id), ['User', 'Group']);
+    assert.equal((await server.inject({ url: '/scim/v2/ResourceTypes/Group' })).statusCode, 200);
+
+    const schemas = (await server.inject({ url: '/scim/v2/Schemas' })).json();
+    const group = schemas.Resources.find((s: { id: string }) => s.id === SCIM_SCHEMA_GROUP);
+    assert.deepEqual(
+      group.attributes.map((a: { name: string }) => a.name),
+      ['displayName', 'externalId', 'members'],
+    );
+  });
+
+  it('requires the API key', async () => {
+    assert.equal((await server.inject({ url: '/scim/v2/Groups' })).statusCode, 401);
+  });
+
+  it('creates a group with members and returns $ref and display', async () => {
+    const user = await create(server, 'a@example.com');
+    const res = await postGroup(newGroup('Engineering', [user.id], { externalId: 'okta-1' }));
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json();
+    assert.deepEqual(body.schemas, [SCIM_SCHEMA_GROUP]);
+    assert.equal(body.displayName, 'Engineering');
+    assert.equal(body.externalId, 'okta-1');
+    assert.equal(body.meta.resourceType, 'Group');
+    assert.match(body.meta.location, /\/scim\/v2\/Groups\/g2$/);
+    assert.equal(body.members.length, 1);
+    assert.equal(body.members[0].value, user.id);
+    assert.equal(body.members[0].display, 'a@example.com');
+    assert.equal(body.members[0].type, 'User');
+    assert.match(body.members[0].$ref, /\/scim\/v2\/Users\/u1$/);
+  });
+
+  it('rejects bad group bodies', async () => {
+    const user = await create(server, 'a@example.com');
+    const cases: object[] = [
+      { schemas: [SCIM_SCHEMA_GROUP] },
+      newGroup(''),
+      newGroup('X', ['nope']),
+      { ...newGroup('X'), members: [{ value: user.id, type: 'Group' }] },
+      { ...newGroup('X'), members: [{ display: 'x' }] },
+      newGroup('X', [], { description: 'x' }),
+      { ...newGroup('X'), schemas: [SCIM_SCHEMA_USER] },
+    ];
+    for (const payload of cases) {
+      const res = await postGroup(payload);
+      assert.equal(res.statusCode, 400, JSON.stringify(payload));
+    }
+    assert.equal(state.groups.size, 0);
+
+    assert.equal((await postGroup(newGroup('X'))).statusCode, 201);
+    assert.equal((await postGroup(newGroup('X'))).statusCode, 409);
+  });
+
+  it('gets, filters and excludes members', async () => {
+    const user = await create(server, 'a@example.com');
+    const g = (await postGroup(newGroup('Engineering', [user.id], { externalId: 'e1' }))).json();
+    await postGroup(newGroup('Sales'));
+
+    const one = (await server.inject({ url: `/scim/v2/Groups/${g.id}`, headers: AUTH })).json();
+    assert.equal(one.members.length, 1);
+
+    const lean = (
+      await server.inject({
+        url: `/scim/v2/Groups/${g.id}?excludedAttributes=members`,
+        headers: AUTH,
+      })
+    ).json();
+    assert.equal(lean.members, undefined);
+    assert.equal(lean.displayName, 'Engineering');
+
+    const get = (qs: string) => server.inject({ url: `/scim/v2/Groups?${qs}`, headers: AUTH });
+    const all = (await get('')).json();
+    assert.deepEqual(
+      all.Resources.map((r: { displayName: string }) => r.displayName),
+      ['Sales', 'Engineering'],
+    );
+
+    const eq = (f: string) => `filter=${encodeURIComponent(f)}`;
+    assert.equal((await get(eq('displayName eq "Engineering"'))).json().totalResults, 1);
+    assert.equal((await get(eq('externalId eq "e1"'))).json().totalResults, 1);
+    assert.equal((await get(eq('displayName co "Eng"'))).statusCode, 400);
+    assert.equal((await get('excludedAttributes=displayName')).statusCode, 400);
+    assert.equal((await get('attributes=displayName')).statusCode, 400);
+    assert.equal((await server.inject({ url: '/scim/v2/Groups/nope', headers: AUTH })).statusCode, 404);
+  });
+
+  it('PATCH handles the member and rename forms Okta and Entra send', async () => {
+    const a = (await create(server, 'a@example.com')).id;
+    const b = (await create(server, 'b@example.com')).id;
+    const c = (await create(server, 'c@example.com')).id;
+    const g = (await postGroup(newGroup('Engineering', [a]))).json().id;
+
+    // Okta: add members
+    let res = await patchGroup(g, [{ op: 'add', path: 'members', value: [{ value: b }, { value: c }] }]);
+    assert.equal(res.statusCode, 204, res.body);
+    assert.deepEqual(memberIds(g), [a, b, c].sort());
+    assert.deepEqual(state.groupUpdates.at(-1)!.members, { add: [b, c], remove: [] });
+
+    // Okta: remove a member by filter
+    res = await patchGroup(g, [{ op: 'remove', path: `members[value eq "${b}"]` }]);
+    assert.equal(res.statusCode, 204, res.body);
+    assert.deepEqual(memberIds(g), [a, c].sort());
+
+    // Entra: remove with a value list
+    res = await patchGroup(g, [{ op: 'Remove', path: 'members', value: [{ value: c }] }]);
+    assert.equal(res.statusCode, 204, res.body);
+    assert.deepEqual(memberIds(g), [a]);
+
+    // Okta: rename with a no-path replace carrying the id
+    res = await patchGroup(g, [{ op: 'replace', value: { id: g, displayName: 'Platform' } }]);
+    assert.equal(res.statusCode, 204, res.body);
+    assert.equal(state.groups.get(g)!.group.displayName, 'Platform');
+    assert.equal(state.groupUpdates.at(-1)!.members, undefined);
+    assert.equal(state.groupUpdates.at(-1)!.previous.displayName, 'Engineering');
+
+    // Replace all members, then remove all
+    res = await patchGroup(g, [{ op: 'replace', path: 'members', value: [{ value: b }] }]);
+    assert.equal(res.statusCode, 204, res.body);
+    assert.deepEqual(memberIds(g), [b]);
+    res = await patchGroup(g, [{ op: 'remove', path: 'members' }]);
+    assert.equal(res.statusCode, 204, res.body);
+    assert.deepEqual(memberIds(g), []);
+
+    // Operations fold in order
+    res = await patchGroup(g, [
+      { op: 'add', path: 'members', value: [{ value: a }, { value: b }] },
+      { op: 'remove', path: `members[value eq "${a}"]` },
+      { op: 'replace', path: `${SCIM_SCHEMA_GROUP}:externalId`, value: 'x1' },
+    ]);
+    assert.equal(res.statusCode, 204, res.body);
+    assert.deepEqual(state.groupUpdates.at(-1)!.members, { add: [b], remove: [a] });
+    assert.deepEqual(memberIds(g), [b]);
+    assert.equal(state.groups.get(g)!.group.externalId, 'x1');
+  });
+
+  it('PATCH rejects what it cannot apply', async () => {
+    const g = (await postGroup(newGroup('Engineering'))).json().id;
+    const cases: Array<[object[], string]> = [
+      [[{ op: 'add', path: 'members', value: [{ value: 'nope' }] }], 'invalidValue'],
+      [[{ op: 'remove', path: 'displayName' }], 'invalidValue'],
+      [[{ op: 'replace', path: 'displayName', value: 5 }], 'invalidValue'],
+      [[{ op: 'replace', path: 'members[value eq "x"]', value: [] }], 'invalidPath'],
+      [[{ op: 'replace', path: 'description', value: 'x' }], 'invalidPath'],
+      [[{ op: 'replace', value: { id: 'other' } }], 'mutability'],
+      [[{ op: 'remove' }], 'noTarget'],
+      [[{ op: 'move', path: 'displayName', value: 'x' }], 'invalidSyntax'],
+    ];
+    for (const [operations, scimType] of cases) {
+      const res = await patchGroup(g, operations);
+      assert.equal(res.statusCode, 400, JSON.stringify(operations));
+      assert.equal(res.json().scimType, scimType, JSON.stringify(operations));
+    }
+    assert.equal((await patchGroup('nope', [{ op: 'remove', path: 'members' }])).statusCode, 404);
+  });
+
+  it('PUT replaces attributes and members', async () => {
+    const a = (await create(server, 'a@example.com')).id;
+    const b = (await create(server, 'b@example.com')).id;
+    const g = (await postGroup(newGroup('Engineering', [a], { externalId: 'e1' }))).json().id;
+
+    const res = await server.inject({
+      method: 'PUT',
+      url: `/scim/v2/Groups/${g}`,
+      headers: SCIM_JSON,
+      payload: newGroup('Platform', [b]),
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json();
+    assert.equal(body.displayName, 'Platform');
+    assert.equal(body.externalId, undefined);
+    assert.deepEqual(body.members.map((m: { value: string }) => m.value), [b]);
+    assert.deepEqual(state.groupUpdates.at(-1)!.members, { replace: [b] });
+  });
+
+  it('deletes a group', async () => {
+    const g = (await postGroup(newGroup('Engineering'))).json().id;
+    const del = () => server.inject({ method: 'DELETE', url: `/scim/v2/Groups/${g}`, headers: AUTH });
+    assert.equal((await del()).statusCode, 204);
+    assert.equal(state.groups.size, 0);
+    assert.equal((await del()).statusCode, 404);
+  });
+});
+
+describe('SCIM server without groups', () => {
+  it('answers /Groups with a SCIM 404 and does not advertise Group', async () => {
+    resetState();
+    const server = await createScimServer({
+      module: memoryModule(true),
+      config: config(),
+      backendConfig: null,
+      sink: new MemorySink(),
+    });
+    assert.equal((await server.inject({ url: '/scim/v2/Groups', headers: AUTH })).statusCode, 404);
+    const types = (await server.inject({ url: '/scim/v2/ResourceTypes' })).json();
+    assert.deepEqual(types.Resources.map((t: { id: string }) => t.id), ['User']);
     await server.close();
   });
 });

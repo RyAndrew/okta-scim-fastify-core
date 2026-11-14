@@ -9,6 +9,7 @@
 
 import type { FastifyBaseLogger } from 'fastify';
 import type { Env } from './env';
+import type { GroupAttributePath, GroupAttributes, StoredGroup } from './group-attributes';
 import type { StoredUser, UserAttributePath, UserAttributes } from './user-attributes';
 
 export type UserLookupKey = 'id' | 'userName' | 'externalId' | 'email';
@@ -72,6 +73,77 @@ export interface ScimUserBackend {
 
   /** Present only if the backend can set passwords; its presence is the capability. */
   setPassword?(id: string, password: string): Promise<void>;
+
+  /** Present only if the backend stores groups; its presence enables /Groups. */
+  readonly groups?: ScimGroupBackend;
+}
+
+// ---------------------------------------------------------------------------
+// Groups (optional)
+// ---------------------------------------------------------------------------
+
+export type GroupLookupKey = 'id' | 'displayName' | 'externalId';
+
+export interface GroupLookup {
+  by: GroupLookupKey;
+  value: string;
+}
+
+export interface GroupQuery {
+  /** Absent means all groups. */
+  lookup?: GroupLookup;
+  /** 1-based, already validated. */
+  startIndex: number;
+  /** Already validated; may be 0, which asks for the total only. */
+  count: number;
+  /** The required ordering. Always passed; ties are broken by id ascending. */
+  sort: UserSort;
+  /** `false` when the client sent `excludedAttributes=members`. */
+  includeMembers: boolean;
+}
+
+export interface GroupPage {
+  groups: StoredGroup[];
+  /** Number of groups matching the lookup, before paging. */
+  totalResults: number;
+}
+
+/**
+ * A change to a group's membership, as user ids. Membership crosses the
+ * boundary as a delta so that a PATCH never loads a large group's full list.
+ * - `replace`: the complete new member list.
+ * - `add` / `remove`: applied in that order; adding a member already present
+ *   and removing one that is absent are no-ops (RFC 7644 §3.5.2).
+ */
+export type MemberChange = { replace: string[] } | { add: string[]; remove: string[] };
+
+export interface GroupUpdate {
+  /** The group as the backend returned it at the start of this request (without members). */
+  previous: GroupAttributes;
+  /** The complete target state of the group's own attributes. Absent = clear. */
+  group: GroupAttributes;
+  /** Absent means membership is unchanged. */
+  members?: MemberChange;
+}
+
+/**
+ * Implemented by a backend that stores groups. A member id that is not an
+ * existing user must be rejected (400 `invalidValue`), never skipped.
+ */
+export interface ScimGroupBackend {
+  /** The group attributes this backend stores. Must include `displayName`. */
+  readonly attributes: readonly GroupAttributePath[];
+  /** The attributes `listGroups` can look up by with `eq`. Must include `id`. */
+  readonly lookups: readonly GroupLookupKey[];
+
+  /** `null` means the group does not exist. */
+  getGroup(id: string, options: { includeMembers: boolean }): Promise<StoredGroup | null>;
+  listGroups(query: GroupQuery): Promise<GroupPage>;
+  /** Returns the new group's id. */
+  createGroup(group: GroupAttributes, memberIds: string[]): Promise<string>;
+  /** Called for every PUT and PATCH. */
+  updateGroup(id: string, update: GroupUpdate): Promise<void>;
+  deleteGroup(id: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
