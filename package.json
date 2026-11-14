@@ -1,20 +1,24 @@
 {
   "name": "scim-fastify-core",
-  "version": "1.0.0",
-  "description": "Shared SCIM 2.0 protocol layer for Fastify-based SCIM bridges",
+  "version": "2.0.0",
+  "description": "Shared SCIM 2.0 server for Fastify-based SCIM bridges: protocol, audit and configuration, with pluggable directory backends",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist"],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
   },
   "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "dotenv": "^17.3.1",
     "fastify": "^5.7.4",
-    "fastify-plugin": "^5.1.0"
+    "knex": "^3.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }
 }

@@ -1,8 +1,10 @@
 // ---------------------------------------------------------------------------
-// SCIM 2.0 core type definitions (RFC 7643 / RFC 7644)
+// SCIM 2.0 wire types (RFC 7643 / RFC 7644)
 // ---------------------------------------------------------------------------
 
 export const SCIM_SCHEMA_USER = 'urn:ietf:params:scim:schemas:core:2.0:User';
+export const SCIM_SCHEMA_ENTERPRISE_USER =
+  'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User';
 export const SCIM_SCHEMA_GROUP = 'urn:ietf:params:scim:schemas:core:2.0:Group';
 export const SCIM_SCHEMA_LIST = 'urn:ietf:params:scim:api:messages:2.0:ListResponse';
 export const SCIM_SCHEMA_ERROR = 'urn:ietf:params:scim:api:messages:2.0:Error';
@@ -17,11 +19,34 @@ export interface ScimName {
   honorificSuffix?: string;
 }
 
-export interface ScimEmail {
+/** A multi-valued attribute entry such as an email or phone number. */
+export interface ScimMultiValue {
   value: string;
   display?: string;
   type?: string;
   primary?: boolean;
+}
+
+export type ScimEmail = ScimMultiValue;
+
+/** A postal address (RFC 7643 §4.1.2). Unlike other multi-valued entries it has no `value`. */
+export interface ScimAddress {
+  formatted?: string;
+  streetAddress?: string;
+  locality?: string;
+  region?: string;
+  postalCode?: string;
+  country?: string;
+  type?: string;
+  primary?: boolean;
+}
+
+export interface ScimEnterpriseUser {
+  employeeNumber?: string;
+  costCenter?: string;
+  organization?: string;
+  division?: string;
+  department?: string;
 }
 
 export interface ScimMeta {
@@ -32,10 +57,7 @@ export interface ScimMeta {
   version?: string;
 }
 
-// ---------------------------------------------------------------------------
-// SCIM User resource (RFC 7643 §4.1)
-// ---------------------------------------------------------------------------
-
+/** A User resource as it appears in a response. `password` is never present. */
 export interface ScimUser {
   schemas: string[];
   id: string;
@@ -51,21 +73,20 @@ export interface ScimUser {
   locale?: string;
   timezone?: string;
   active?: boolean;
-  password?: string;
   emails?: ScimEmail[];
-  meta?: ScimMeta;
+  phoneNumbers?: ScimMultiValue[];
+  addresses?: ScimAddress[];
+  [SCIM_SCHEMA_ENTERPRISE_USER]?: ScimEnterpriseUser;
+  meta: ScimMeta;
 }
 
 // ---------------------------------------------------------------------------
-// SCIM Group resource (RFC 7643 §4.2)
+// Groups (RFC 7643 §4.2) — types only; Groups are not wired into the server yet
 // ---------------------------------------------------------------------------
 
 export interface ScimGroupMember {
-  /** User id */
   value: string;
-  /** URL reference to the User resource */
   $ref?: string;
-  /** Display name of the member */
   display?: string;
   type?: 'User' | 'Group';
 }
@@ -80,7 +101,7 @@ export interface ScimGroup {
 }
 
 // ---------------------------------------------------------------------------
-// SCIM List response
+// Protocol messages
 // ---------------------------------------------------------------------------
 
 export interface ScimListResponse<T> {
@@ -91,25 +112,16 @@ export interface ScimListResponse<T> {
   Resources: T[];
 }
 
-// ---------------------------------------------------------------------------
-// SCIM Error response
-// ---------------------------------------------------------------------------
-
 export interface ScimErrorBody {
   schemas: string[];
-  status: number;
+  /** HTTP status code as a string, per RFC 7644 §3.12. */
+  status: string;
   scimType?: string;
   detail: string;
 }
 
-// ---------------------------------------------------------------------------
-// SCIM Patch operation (RFC 7644 §3.5.2)
-// ---------------------------------------------------------------------------
-
-export type PatchOpVerb = 'add' | 'remove' | 'replace';
-
 export interface PatchOperation {
-  op: PatchOpVerb;
+  op: string;
   path?: string;
   value?: unknown;
 }
@@ -117,58 +129,4 @@ export interface PatchOperation {
 export interface ScimPatchOp {
   schemas: string[];
   Operations: PatchOperation[];
-}
-
-// ---------------------------------------------------------------------------
-// Backend contracts
-// ---------------------------------------------------------------------------
-
-type ParsedFilter = import('./filter-parser').ParsedFilter;
-
-export interface ListUsersOptions {
-  filter?: ParsedFilter;
-  startIndex: number;
-  count: number;
-}
-
-export interface ListUsersResult {
-  users: ScimUser[];
-  totalResults: number;
-}
-
-export interface ListGroupsOptions {
-  filter?: ParsedFilter;
-  startIndex: number;
-  count: number;
-}
-
-export interface ListGroupsResult {
-  groups: ScimGroup[];
-  totalResults: number;
-}
-
-/**
- * Every downstream user backend must implement this interface.
- * Methods throw {@link ScimBackendError} to signal protocol-level errors.
- */
-export interface ScimBackend {
-  listUsers(opts: ListUsersOptions): Promise<ListUsersResult>;
-  getUser(id: string): Promise<ScimUser>;
-  createUser(user: ScimUser): Promise<ScimUser>;
-  replaceUser(id: string, user: ScimUser): Promise<ScimUser>;
-  patchUser(id: string, patch: ScimPatchOp): Promise<ScimUser>;
-  deleteUser(id: string): Promise<void>;
-}
-
-/**
- * Every downstream group backend must implement this interface.
- * Methods throw {@link ScimBackendError} to signal protocol-level errors.
- */
-export interface ScimGroupBackend {
-  listGroups(opts: ListGroupsOptions): Promise<ListGroupsResult>;
-  getGroup(id: string): Promise<ScimGroup>;
-  createGroup(group: ScimGroup): Promise<ScimGroup>;
-  replaceGroup(id: string, group: ScimGroup): Promise<ScimGroup>;
-  patchGroup(id: string, patch: ScimPatchOp): Promise<ScimGroup>;
-  deleteGroup(id: string): Promise<void>;
 }

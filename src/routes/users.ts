@@ -1,210 +1,268 @@
 // ---------------------------------------------------------------------------
-// SCIM 2.0 /Users route factory (RFC 7644 §3.3–§3.6)
+// SCIM 2.0 /Users routes (RFC 7644 §3.3–§3.6)
 //
-// Usage:
-//   await server.register(createScimUsersPlugin(backend), {
-//     prefix: '/scim/v2/Users',
-//   });
+// These routes own the protocol. The backend is only ever asked to read,
+// list, create, update, delete or set a password, always with SCIM-shaped,
+// already validated data.
 // ---------------------------------------------------------------------------
 
-import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import fp from 'fastify-plugin';
-import { ScimBackendError } from '../errors';
-import { parseScimFilter } from '../filter-parser';
-import { withScimMeta, formatListResponse, formatError } from '../formatter';
-import { registerScimJsonParser, scimBodyRouteOptions } from '../request-body';
-import { ScimUser, ScimPatchOp, ScimBackend } from '../types';
+import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
+import { auditNote, inRequestContext } from '../audit/request-audit';
+import type { ScimUserBackend, UserLookup } from '../backend';
+import type { CoreConfig } from '../config';
+import { ScimBackendError, ScimErrors } from '../errors';
+import { resolveUserLookup } from '../filter-parser';
+import { applyPatchOps } from '../patch-applier';
+import type { AuthHook } from '../plugins/auth';
+import { SCIM_CONTENT_TYPE, formatListResponse, toUserResource } from '../responses';
+import { SCIM_SCHEMA_PATCH_OP, SCIM_SCHEMA_USER } from '../types';
+import {
+  StoredUser,
+  UserAttributes,
+  attributesOf,
+  changedAttributes,
+  parseUserAttributes,
+  stripUnassigned,
+} from '../user-attributes';
 
-// Import for FastifyInstance.authenticate type augmentation
-import '../plugins/auth';
+export interface UsersRoutesOptions {
+  backend: ScimUserBackend;
+  config: Pick<CoreConfig, 'unsupportedAttributes' | 'defaultCount' | 'maxCount'>;
+  authenticate: AuthHook;
+}
+
+type Body = Record<string, unknown>;
+
+const JSON_CONTENT_TYPE = /^application\/(scim\+)?json\s*(;|$)/i;
+
+/** Members of a User that the client cannot set (RFC 7643 `readOnly`). */
+const READ_ONLY_MEMBERS = ['id', 'meta', 'groups'];
+
+const UNSUPPORTED_LIST_PARAMETERS = ['sortBy', 'sortOrder', 'attributes', 'excludedAttributes'];
 
 // ---------------------------------------------------------------------------
-// Options
-// ---------------------------------------------------------------------------
 
-export interface ScimUsersPluginOptions {
-  /**
-   * The mounted path of the /Users collection, used to build meta.location.
-   * Defaults to '/scim/v2/Users'. Must match the `prefix` passed to register().
-   */
-  usersPath?: string;
+export function scimUsersRoutes(options: UsersRoutesOptions): FastifyPluginAsync {
+  const { backend, config } = options;
+  const declared: ReadonlySet<string> = new Set(backend.attributes);
+
+  return async function usersRoutes(server: FastifyInstance): Promise<void> {
+    server.addHook('onRequest', options.authenticate);
+
+    const usersUrl = (request: FastifyRequest): string =>
+      `${request.protocol}://${request.host}${server.prefix}`;
+
+    /** Read a user or throw 404. */
+    async function requireUser(id: string): Promise<StoredUser> {
+      const user = await backend.getUser(id);
+      if (!user) throw ScimErrors.notFound(id);
+      return user;
+    }
+
+    /** Validate a client-supplied profile and separate the password from it. */
+    function readProfile(raw: Body): { user: UserAttributes; password: string | undefined } {
+      const cleaned = (stripUnassigned(raw) ?? {}) as Body;
+      const { password, ...profile } = cleaned;
+
+      if (password !== undefined && (typeof password !== 'string' || password.length === 0)) {
+        throw ScimErrors.invalidValue("'password' must be a non-empty string.");
+      }
+      if (password !== undefined && !backend.setPassword) {
+        throw ScimErrors.invalidValue('This service provider does not support setting passwords.');
+      }
+
+      const { attributes, ignored } = parseUserAttributes(
+        profile,
+        declared,
+        config.unsupportedAttributes,
+      );
+      if (ignored.length > 0) auditNote('ignoredAttributes', ignored);
+      if (password !== undefined) auditNote('passwordChange', true);
+
+      return { user: attributes, password: password as string | undefined };
+    }
+
+    /** Shared tail of PUT and PATCH: hand the target state to the backend. */
+    async function applyUpdate(
+      request: FastifyRequest,
+      stored: StoredUser,
+      target: Body,
+    ): Promise<object> {
+      const previous = attributesOf(stored);
+      const { user, password } = readProfile(target);
+      auditNote('changedAttributes', changedAttributes(previous, user));
+
+      // Password first, so enabling an account never races a missing password
+      if (password !== undefined) await backend.setPassword!(stored.id, password);
+      await backend.updateUser(stored.id, { previous, user });
+
+      return toUserResource(await requireUser(stored.id), usersUrl(request));
+    }
+
+    // ── GET /Users ─────────────────────────────────────────────────────────
+
+    server.get<{ Querystring: Record<string, string | undefined> }>('/', (request, reply) =>
+      inRequestContext(request, async () => {
+        const query = request.query;
+
+        for (const name of UNSUPPORTED_LIST_PARAMETERS) {
+          if (query[name] !== undefined) {
+            throw ScimErrors.invalidValue(`Query parameter '${name}' is not supported.`);
+          }
+        }
+
+        // RFC 7644 §3.4.2.4: startIndex below 1 means 1; a negative count means 0
+        const startIndex = Math.max(1, readInteger(query.startIndex, 'startIndex') ?? 1);
+        const requested = readInteger(query.count, 'count') ?? config.defaultCount;
+        const count = Math.min(config.maxCount, Math.max(0, requested));
+
+        let lookup: UserLookup | undefined;
+        if (query.filter !== undefined) {
+          lookup = resolveUserLookup(query.filter, backend.lookups);
+        }
+
+        const page = await backend.listUsers({
+          lookup,
+          startIndex,
+          count,
+          sort: { by: 'created', order: 'descending' },
+        });
+
+        const base = usersUrl(request);
+        return reply
+          .status(200)
+          .type(SCIM_CONTENT_TYPE)
+          .send(
+            formatListResponse(
+              page.users.map((u) => toUserResource(u, base)),
+              page.totalResults,
+              startIndex,
+            ),
+          );
+      }),
+    );
+
+    // ── GET /Users/:id ─────────────────────────────────────────────────────
+
+    server.get<{ Params: { id: string } }>('/:id', (request, reply) =>
+      inRequestContext(request, async () => {
+        const user = await requireUser(request.params.id);
+        return reply
+          .status(200)
+          .type(SCIM_CONTENT_TYPE)
+          .send(toUserResource(user, usersUrl(request)));
+      }),
+    );
+
+    // ── POST /Users ────────────────────────────────────────────────────────
+
+    server.post('/', (request, reply) =>
+      inRequestContext(request, async () => {
+        const body = requireBody(request, SCIM_SCHEMA_USER);
+        const { user, password } = readProfile(withoutProtocolMembers(body));
+
+        const id = await backend.createUser(user, password);
+        const created = await backend.getUser(id);
+        if (!created) {
+          throw ScimErrors.backend(`User ${id} was created but could not be read back.`);
+        }
+
+        const resource = toUserResource(created, usersUrl(request));
+        return reply
+          .status(201)
+          .header('Location', resource.meta.location!)
+          .type(SCIM_CONTENT_TYPE)
+          .send(resource);
+      }),
+    );
+
+    // ── PUT /Users/:id ─────────────────────────────────────────────────────
+
+    server.put<{ Params: { id: string } }>('/:id', (request, reply) =>
+      inRequestContext(request, async () => {
+        const body = requireBody(request, SCIM_SCHEMA_USER);
+        const stored = await requireUser(request.params.id);
+
+        // The body is the complete target state (RFC 7644 §3.5.1): an attribute
+        // the backend stores but the body omits is cleared.
+        const resource = await applyUpdate(request, stored, withoutProtocolMembers(body));
+        return reply.status(200).type(SCIM_CONTENT_TYPE).send(resource);
+      }),
+    );
+
+    // ── PATCH /Users/:id ───────────────────────────────────────────────────
+
+    server.patch<{ Params: { id: string } }>('/:id', (request, reply) =>
+      inRequestContext(request, async () => {
+        const body = requireBody(request, SCIM_SCHEMA_PATCH_OP);
+        const operations = body.Operations;
+        if (!Array.isArray(operations) || operations.length === 0) {
+          throw ScimErrors.invalidSyntax('Operations array is required and must not be empty.');
+        }
+
+        const stored = await requireUser(request.params.id);
+        const target = applyPatchOps<Body>({ ...attributesOf(stored) }, operations);
+
+        for (const member of [...READ_ONLY_MEMBERS, 'schemas']) {
+          if (member in target) {
+            throw ScimErrors.mutability(`Attribute '${member}' is read-only.`);
+          }
+        }
+
+        const resource = await applyUpdate(request, stored, target);
+        return reply.status(200).type(SCIM_CONTENT_TYPE).send(resource);
+      }),
+    );
+
+    // ── DELETE /Users/:id ──────────────────────────────────────────────────
+
+    server.delete<{ Params: { id: string } }>('/:id', (request, reply) =>
+      inRequestContext(request, async () => {
+        const stored = await requireUser(request.params.id);
+        await backend.deleteUser(stored.id);
+        return reply.status(204).send();
+      }),
+    );
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
 
-export function createScimUsersPlugin(
-  backend: ScimBackend,
-  pluginOptions: ScimUsersPluginOptions = {},
-) {
-  const usersPath = pluginOptions.usersPath ?? '/scim/v2/Users';
+/** The request body as a JSON object carrying the expected schema URN. */
+function requireBody(request: FastifyRequest, schema: string): Body {
+  const contentType = request.headers['content-type'] ?? '';
+  if (!JSON_CONTENT_TYPE.test(contentType)) {
+    throw new ScimBackendError(
+      415,
+      `Unsupported Content-Type '${contentType || '(none)'}'; ` +
+        `use ${SCIM_CONTENT_TYPE} or application/json.`,
+    );
+  }
 
-  return fp(
-    async function scimUsersPlugin(server: FastifyInstance): Promise<void> {
-      server.addHook('onRequest', server.authenticate);
-      registerScimJsonParser(server);
+  const body = request.body;
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw ScimErrors.invalidSyntax('Request body must be a JSON object.');
+  }
 
-      function usersBaseUrl(request: FastifyRequest): string {
-        return `${request.protocol}://${request.hostname}${usersPath}`;
-      }
+  const schemas = (body as Body).schemas;
+  if (!Array.isArray(schemas) || !schemas.includes(schema)) {
+    throw ScimErrors.invalidSyntax(`Request body 'schemas' must include '${schema}'.`);
+  }
+  return body as Body;
+}
 
-      function handleError(err: unknown, reply: FastifyReply, context: string): FastifyReply {
-        if (err instanceof ScimBackendError) {
-          return reply.status(err.status).send(formatError(err.status, err.detail, err.scimType));
-        }
-        server.log.error({ err }, context);
-        return reply.status(500).send(formatError(500, 'Internal server error'));
-      }
+/** RFC 7644 §3.3/§3.5.1: read-only members in a request body are ignored. */
+function withoutProtocolMembers(body: Body): Body {
+  const profile = { ...body };
+  delete profile.schemas;
+  for (const member of READ_ONLY_MEMBERS) delete profile[member];
+  return profile;
+}
 
-      // ────────────────────────────────────────────────────────────────────
-      // GET /Users  — list / search
-      // ────────────────────────────────────────────────────────────────────
-
-      server.get<{
-        Querystring: { filter?: string; startIndex?: string; count?: string };
-      }>('/', async (request, reply) => {
-        const { filter, startIndex: startIndexStr, count: countStr } = request.query;
-        const startIndex = Math.max(1, parseInt(startIndexStr ?? '1', 10));
-        const count = Math.min(200, Math.max(1, parseInt(countStr ?? '100', 10)));
-        const parsedFilter = filter ? parseScimFilter(filter) ?? undefined : undefined;
-
-        try {
-          const { users, totalResults } = await backend.listUsers({
-            filter: parsedFilter,
-            startIndex,
-            count,
-          });
-
-          const base = usersBaseUrl(request);
-          const resources = users.map((u) => withScimMeta(u, base));
-
-          return reply
-            .status(200)
-            .header('Content-Type', 'application/scim+json')
-            .send(formatListResponse(resources, totalResults, startIndex));
-        } catch (err) {
-          return handleError(err, reply, 'GET /Users failed');
-        }
-      });
-
-      // ────────────────────────────────────────────────────────────────────
-      // GET /Users/:id
-      // ────────────────────────────────────────────────────────────────────
-
-      server.get<{ Params: { id: string } }>('/:id', async (request, reply) => {
-        const { id } = request.params;
-
-        try {
-          const user = await backend.getUser(id);
-          return reply
-            .status(200)
-            .header('Content-Type', 'application/scim+json')
-            .send(withScimMeta(user, usersBaseUrl(request)));
-        } catch (err) {
-          return handleError(err, reply, 'GET /Users/:id failed');
-        }
-      });
-
-      // ────────────────────────────────────────────────────────────────────
-      // POST /Users  — provision
-      // ────────────────────────────────────────────────────────────────────
-
-      server.post<{ Body: ScimUser }>('/', scimBodyRouteOptions, async (request, reply) => {
-        const scimUser = request.body;
-
-        if (!scimUser.userName) {
-          return reply
-            .status(400)
-            .send(formatError(400, 'userName is required.', 'invalidValue'));
-        }
-
-        try {
-          const created = await backend.createUser(scimUser);
-          const resource = withScimMeta(created, usersBaseUrl(request));
-
-          return reply
-            .status(201)
-            .header('Location', resource.meta!.location!)
-            .header('Content-Type', 'application/scim+json')
-            .send(resource);
-        } catch (err) {
-          return handleError(err, reply, 'POST /Users failed');
-        }
-      });
-
-      // ────────────────────────────────────────────────────────────────────
-      // PUT /Users/:id  — full replace
-      // ────────────────────────────────────────────────────────────────────
-
-      server.put<{ Params: { id: string }; Body: ScimUser }>(
-        '/:id',
-        scimBodyRouteOptions,
-        async (request, reply) => {
-          const { id } = request.params;
-
-          try {
-            const updated = await backend.replaceUser(id, request.body);
-            return reply
-              .status(200)
-              .header('Content-Type', 'application/scim+json')
-              .send(withScimMeta(updated, usersBaseUrl(request)));
-          } catch (err) {
-            return handleError(err, reply, 'PUT /Users/:id failed');
-          }
-        },
-      );
-
-      // ────────────────────────────────────────────────────────────────────
-      // PATCH /Users/:id  — partial update
-      // ────────────────────────────────────────────────────────────────────
-
-      server.patch<{ Params: { id: string }; Body: ScimPatchOp }>(
-        '/:id',
-        scimBodyRouteOptions,
-        async (request, reply) => {
-          const { id } = request.params;
-          const patch = request.body;
-
-          if (!Array.isArray(patch.Operations) || patch.Operations.length === 0) {
-            return reply
-              .status(400)
-              .send(
-                formatError(
-                  400,
-                  'Operations array is required and must not be empty.',
-                  'invalidValue',
-                ),
-              );
-          }
-
-          try {
-            const updated = await backend.patchUser(id, patch);
-            return reply
-              .status(200)
-              .header('Content-Type', 'application/scim+json')
-              .send(withScimMeta(updated, usersBaseUrl(request)));
-          } catch (err) {
-            return handleError(err, reply, 'PATCH /Users/:id failed');
-          }
-        },
-      );
-
-      // ────────────────────────────────────────────────────────────────────
-      // DELETE /Users/:id  — deprovision
-      // ────────────────────────────────────────────────────────────────────
-
-      server.delete<{ Params: { id: string } }>('/:id', async (request, reply) => {
-        const { id } = request.params;
-
-        try {
-          await backend.deleteUser(id);
-          return reply.status(204).send();
-        } catch (err) {
-          return handleError(err, reply, 'DELETE /Users/:id failed');
-        }
-      });
-    },
-    { name: 'scim-users' },
-  );
+function readInteger(raw: string | undefined, name: string): number | undefined {
+  if (raw === undefined) return undefined;
+  if (!/^-?\d+$/.test(raw)) {
+    throw ScimErrors.invalidValue(`Query parameter '${name}' must be an integer.`);
+  }
+  return Number(raw);
 }
